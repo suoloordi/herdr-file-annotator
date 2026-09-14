@@ -733,23 +733,36 @@ enum InputMode {
     },
 }
 
-/// A single-line editor with tui-textarea's default Emacs-style bindings.
+/// A text editor with tui-textarea's default Emacs-style bindings.
 fn input_editor(text: String) -> TextArea<'static> {
-    let mut editor = TextArea::new(vec![text]);
+    let mut editor = TextArea::new(text.split('\n').map(str::to_owned).collect());
     editor.move_cursor(CursorMove::End);
     editor
 }
 
-fn input_text<'a>(editor: &'a TextArea<'static>) -> &'a str {
-    editor.lines().first().map(String::as_str).unwrap_or_default()
+/// TextArea keeps physical lines separately; annotations use newline-delimited text.
+fn input_text(editor: &TextArea<'static>) -> String {
+    editor.lines().join("\n")
 }
 
 /// Insert the visible caret at tui-textarea's character-wise cursor position.
 fn input_display_text(editor: &TextArea<'static>) -> String {
+    let (cursor_row, cursor_col) = editor.cursor();
+    let mut at = 0;
+    for (row, line) in editor.lines().iter().enumerate() {
+        if row == cursor_row {
+            at += line.char_indices().nth(cursor_col).map(|(idx, _)| idx).unwrap_or(line.len());
+            break;
+        }
+        at += line.len() + 1; // the newline inserted by `input_text`
+    }
     let text = input_text(editor);
-    let (_, col) = editor.cursor();
-    let at = text.char_indices().nth(col).map(|(idx, _)| idx).unwrap_or(text.len());
     format!("{}\u{258f}{}", &text[..at], &text[at..])
+}
+
+fn submits_input(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::ALT))
+        || (key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 /// An annotation the reviewer has left but not yet submitted with a verdict.
@@ -896,15 +909,21 @@ fn source_row_to_diff_row(rows: &[DiffRow], cursor: usize) -> usize {
 /// logic as the real layout (header + note + footer chrome, then body_split,
 /// then the diff pane's top/bottom border) — so cursor-following stays
 /// correct in both the side-by-side and stacked layouts.
-fn diff_viewport_rows(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
-    let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(3));
+fn diff_viewport_rows(
+    term_size: Size,
+    show_navigator: bool,
+    nav_width: u16,
+    footer_rows: u16,
+) -> usize {
+    let chrome = 2u16.saturating_add(footer_rows);
+    let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(chrome));
     let (_, diff_area) = body_split(body, show_navigator, nav_width);
     (diff_area.height.saturating_sub(2) as usize).max(1)
 }
 
 /// Half a screen's worth of diff rows.
-fn half_page(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
-    (diff_viewport_rows(term_size, show_navigator, nav_width) / 2).max(1)
+fn half_page(term_size: Size, show_navigator: bool, nav_width: u16, footer_rows: u16) -> usize {
+    (diff_viewport_rows(term_size, show_navigator, nav_width, footer_rows) / 2).max(1)
 }
 
 /// Display rows a wheel/trackpad tick scrolls the diff.
@@ -918,16 +937,22 @@ const HSCROLL_STEP: usize = 8;
 const GUTTER_AND_MARKER_COLS: usize = 12;
 
 /// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
-/// layout: header (1) + note (1) above the body, footer (1) below.
-fn body_rects(term_size: Size, show_navigator: bool, nav_width: u16) -> (Rect, Rect) {
-    let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(3));
+/// layout: header (1) + note (1) above the body and a variable-height footer.
+fn body_rects(
+    term_size: Size,
+    show_navigator: bool,
+    nav_width: u16,
+    footer_rows: u16,
+) -> (Rect, Rect) {
+    let chrome = 2u16.saturating_add(footer_rows);
+    let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(chrome));
     body_split(body, show_navigator, nav_width)
 }
 
 /// Inner (borderless) width of the diff pane — the wrap width for inline
 /// comments; must match what `draw_diff` derives from its render area.
 fn diff_inner_width(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
-    let (_, diff_rect) = body_rects(term_size, show_navigator, nav_width);
+    let (_, diff_rect) = body_rects(term_size, show_navigator, nav_width, 1);
     (diff_rect.width.saturating_sub(2)).max(1) as usize
 }
 
@@ -1600,7 +1625,7 @@ impl<'a> App<'a> {
             let mut outcome = None;
             match &mut mode {
                 InputMode::Summary { editor } => match key.code {
-                    KeyCode::Enter => {
+                    _ if submits_input(&key) => {
                         let text = input_text(editor).trim().to_string();
                         let summary = if text.is_empty() { None } else { Some(text) };
                         outcome = Some(Outcome {
@@ -1626,7 +1651,7 @@ impl<'a> App<'a> {
                     }
                     // Same ctrl+j guard as the summary arm above.
                     KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-                    KeyCode::Enter => {
+                    _ if submits_input(&key) => {
                         let text = input_text(editor).trim().to_string();
                         if !text.is_empty() {
                             match *editing {
@@ -1805,6 +1830,14 @@ impl<'a> App<'a> {
         match &self.input {
             Some(InputMode::Comment { editing: Some(idx), .. }) => Some(*idx),
             _ => None,
+        }
+    }
+
+    /// The summary footer grows one terminal row per explicit input line.
+    fn footer_rows(&self) -> u16 {
+        match &self.input {
+            Some(InputMode::Summary { editor }) => editor.lines().len().min(u16::MAX as usize) as u16,
+            _ => 1,
         }
     }
 
@@ -2094,7 +2127,7 @@ impl<'a> App<'a> {
             self.diff.scroll,
             self.diff.cursor,
             &map,
-            diff_viewport_rows(term_size, self.show_navigator, self.nav_width),
+            diff_viewport_rows(term_size, self.show_navigator, self.nav_width, self.footer_rows()),
         );
     }
 
@@ -2127,7 +2160,8 @@ impl<'a> App<'a> {
         if self.input.is_some() {
             return;
         }
-        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator, self.nav_width);
+        let (nav_rect, diff_rect) =
+            body_rects(term_size, self.show_navigator, self.nav_width, self.footer_rows());
         let in_nav = rect_contains(nav_rect, mouse.column, mouse.row);
         let in_diff = rect_contains(diff_rect, mouse.column, mouse.row);
 
@@ -2234,7 +2268,8 @@ impl<'a> App<'a> {
         } else {
             self.diff.scroll.saturating_sub(WHEEL_STEP)
         };
-        let viewport = diff_viewport_rows(term_size, self.show_navigator, self.nav_width);
+        let viewport =
+            diff_viewport_rows(term_size, self.show_navigator, self.nav_width, self.footer_rows());
         let cursor_disp = map.disp(self.diff.cursor);
         if cursor_disp < self.diff.scroll {
             self.diff.cursor = map.base_at(self.diff.scroll, base_count);
@@ -2336,7 +2371,7 @@ impl<'a> App<'a> {
         if !self.show_navigator || term_size.width < STACK_THRESHOLD {
             return;
         }
-        let (nav_rect, _) = body_rects(term_size, true, self.nav_width);
+        let (nav_rect, _) = body_rects(term_size, true, self.nav_width, self.footer_rows());
         let current = nav_rect.width;
         let target = if widen {
             current.saturating_add(NAV_RESIZE_STEP)
@@ -2356,7 +2391,8 @@ impl<'a> App<'a> {
         if !self.show_navigator || term_size.width < STACK_THRESHOLD {
             return false;
         }
-        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator, self.nav_width);
+        let (nav_rect, diff_rect) =
+            body_rects(term_size, self.show_navigator, self.nav_width, self.footer_rows());
         if nav_rect.width == 0 || row < diff_rect.y || row >= diff_rect.y + diff_rect.height {
             return false;
         }
@@ -2464,12 +2500,21 @@ impl<'a> App<'a> {
                 match (action, key.code) {
                     (Some(Action::Down), _) => self.diff.down(row_count),
                     (Some(Action::Up), _) => self.diff.up(),
-                    (Some(Action::HalfPageDown), _) => {
-                        self.diff.page_down(half_page(term_size, self.show_navigator, self.nav_width), row_count)
-                    }
-                    (Some(Action::HalfPageUp), _) => {
-                        self.diff.page_up(half_page(term_size, self.show_navigator, self.nav_width))
-                    }
+                    (Some(Action::HalfPageDown), _) => self.diff.page_down(
+                        half_page(
+                            term_size,
+                            self.show_navigator,
+                            self.nav_width,
+                            self.footer_rows(),
+                        ),
+                        row_count,
+                    ),
+                    (Some(Action::HalfPageUp), _) => self.diff.page_up(half_page(
+                        term_size,
+                        self.show_navigator,
+                        self.nav_width,
+                        self.footer_rows(),
+                    )),
                     // Hunk jumps only mean something in the diff view.
                     (Some(Action::NextHunk), _) if self.view == ViewMode::Diff => {
                         self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
@@ -2863,7 +2908,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1), // header
             Constraint::Length(1), // note
             Constraint::Min(1),    // body
-            Constraint::Length(1), // footer
+            Constraint::Length(app.footer_rows()),
         ])
         .split(area);
 
@@ -2947,32 +2992,38 @@ fn slim_footer_text(context: &str, keymap: &Keymap, width: usize) -> String {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = match &app.input {
-        // Input bars keep the END of a long buffer visible (that's where the
-        // caret is) by trimming from the left with an ellipsis.
-        Some(InputMode::Summary { editor }) => {
-            summary_footer_text(&input_display_text(editor), area.width as usize)
-        }
+    let lines: Vec<Line> = match &app.input {
+        Some(InputMode::Summary { editor }) => input_display_text(editor)
+            .split('\n')
+            .enumerate()
+            .map(|(row, text)| {
+                if row == 0 {
+                    Line::raw(summary_footer_text(text, area.width as usize))
+                } else {
+                    Line::raw(tail_fit(text, area.width as usize))
+                }
+            })
+            .collect(),
         Some(InputMode::Comment { editor, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
             let label = format!(" comment [tag: {tag_label}]: ");
-            format!(
+            vec![Line::raw(format!(
                 "{label}{}",
                 tail_fit(
                     &input_display_text(editor),
                     (area.width as usize).saturating_sub(label.chars().count()),
                 )
-            )
+            ))]
         }
         None => {
             let context = match app.focus {
                 Focus::Navigator => format!("files ({})", app.files().len()),
                 Focus::Diff => app.cursor_position().unwrap_or_default(),
             };
-            slim_footer_text(&context, &app.keymap, area.width as usize)
+            vec![Line::raw(slim_footer_text(&context, &app.keymap, area.width as usize))]
         }
     };
-    let footer = Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED));
+    let footer = Paragraph::new(lines).style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(footer, area);
 }
 
@@ -3648,15 +3699,16 @@ fn bottom_rule_line(tag: Option<Tag>, width: usize) -> Line<'static> {
     Line::from(Span::styled(SEP.to_string().repeat(width), rule_style))
 }
 
-/// Greedy word wrap on display columns (`str_cols`, ratatui's own model) —
-/// the same width unit `pan_and_clip` uses, so a row of CJK text wraps at
-/// the columns it actually renders as rather than at half that many chars.
-/// A word longer than the width is hard-broken cluster-atomic (UAX #29 via
-/// `graphemes(true)`): a boundary never splits a cluster, so a straddling
-/// wide glyph moves to the next row whole rather than rendering half of it.
-/// Always yields at least one (possibly empty) chunk so an empty live
-/// preview still renders its row.
+/// Greedy word wrap on display columns (`str_cols`, ratatui's own model).
+/// Explicit newlines are hard row breaks; each physical line then wraps at
+/// words, hard-breaking an overlong word cluster-atomically.
 fn wrap_comment(text: &str, width: usize) -> Vec<String> {
+    text.split('\n').flat_map(|line| wrap_comment_line(line, width)).collect()
+}
+
+/// Wrap one physical comment line. Kept separate so `wrap_comment` can retain
+/// explicit blank lines instead of treating a newline as ordinary text.
+fn wrap_comment_line(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -3674,32 +3726,26 @@ fn wrap_comment(text: &str, width: usize) -> Vec<String> {
                 current_cols += sep + word_cols;
                 break;
             }
-            if word_cols > width {
-                // Hard-break an overlong word at whatever space remains,
-                // taking whole clusters until the next one wouldn't fit (but
-                // always at least one, so a single cluster wider than the
-                // whole box still makes forward progress).
-                if current_cols == 0 {
-                    let avail = width.saturating_sub(sep).max(1);
-                    let mut take_cols = 0usize;
-                    let mut take = 0usize;
-                    for g in &word {
-                        let g_cols = str_cols(g).max(1);
-                        if take > 0 && take_cols + g_cols > avail {
-                            break;
-                        }
-                        take_cols += g_cols;
-                        take += 1;
-                        if take_cols >= avail {
-                            break;
-                        }
+            if word_cols > width && current_cols == 0 {
+                let avail = width.saturating_sub(sep).max(1);
+                let mut take_cols = 0usize;
+                let mut take = 0usize;
+                for g in &word {
+                    let g_cols = str_cols(g).max(1);
+                    if take > 0 && take_cols + g_cols > avail {
+                        break;
                     }
-                    let taken: String = word.drain(..take).collect();
-                    current.push_str(&taken);
-                    chunks.push(std::mem::take(&mut current));
-                    current_cols = 0;
-                    continue;
+                    take_cols += g_cols;
+                    take += 1;
+                    if take_cols >= avail {
+                        break;
+                    }
                 }
+                let taken: String = word.drain(..take).collect();
+                current.push_str(&taken);
+                chunks.push(std::mem::take(&mut current));
+                current_cols = 0;
+                continue;
             }
             chunks.push(std::mem::take(&mut current));
             current_cols = 0;
@@ -4707,6 +4753,8 @@ mod tests {
         let chunks = wrap_comment("abcdefghijklmnop", 5);
         assert_eq!(chunks.concat(), "abcdefghijklmnop");
         assert!(chunks.iter().all(|c| c.chars().count() <= 5));
+        // Explicit line breaks survive wrapping, including a blank row.
+        assert_eq!(wrap_comment("first\n\nlast", 20), vec!["first", "", "last"]);
         // Empty text still occupies one row (the live preview's empty state).
         assert_eq!(wrap_comment("", 10), vec![""]);
     }
@@ -4950,8 +4998,7 @@ mod tests {
         // Narrow + short terminal: a small diff viewport and a narrow wrap
         // width so a modest amount of typed text wraps into several rows.
         let size = Size::new(30, 12);
-        let viewport = diff_viewport_rows(size, app.show_navigator, app.nav_width);
-
+        let viewport = diff_viewport_rows(size, app.show_navigator, app.nav_width, app.footer_rows());
         // Move the cursor to the LAST row (sample_file flattens to 8 rows:
         // 0..=7) so the comment box opens right at the viewport's bottom.
         for _ in 0..7 {
@@ -6115,8 +6162,7 @@ mod tests {
         assert!(app.show_navigator);
 
         let map = app.disp_map(diff_inner_width(term, true, 0));
-        let viewport = diff_viewport_rows(term, true, 0);
-        let cursor_disp = map.disp(app.diff.cursor);
+        let viewport = diff_viewport_rows(term, true, 0, app.footer_rows());        let cursor_disp = map.disp(app.diff.cursor);
         assert!(
             cursor_disp >= app.diff.scroll && cursor_disp < app.diff.scroll + viewport,
             "cursor display row {cursor_disp} outside viewport [{}, {})",
@@ -6695,10 +6741,23 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), size);
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), size);
         app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), size);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
 
         assert_eq!(app.pending.len(), 1);
-        assert_eq!(app.pending[0].annotation.comment, ">alpha Xbeta");
+        assert_eq!(app.pending[0].annotation.comment, ">\nzalpha Xbeta");
+
+        app.input = Some(InputMode::Summary {
+            editor: input_editor("first".to_string()),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), size);
+        assert_eq!(app.footer_rows(), 2, "summary footer grows for its second line");
+        let outcome = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size)
+            .expect("Enter submits the summary");
+        assert_eq!(outcome.summary.as_deref(), Some("first\ns"));
     }
 
     #[test]
