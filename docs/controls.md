@@ -73,9 +73,11 @@ Mouse: drag over the lines, then press `c`.
 The comment and request-changes summary inputs use standard Emacs-style
 editing bindings supplied by `tui-textarea`, including arrows, `Ctrl-A` / `Ctrl-E`,
 `Ctrl-B` / `Ctrl-F`, `Alt-B` / `Alt-F`, word deletion, undo/redo, and yank.
-`Enter` submits, while `Alt-Enter` inserts a line break in either input. The
-request-changes summary footer grows for its explicit lines. `Esc` closes the
-input, `Ctrl-T` cycles a comment tag, and `Ctrl-C` cancels the review.
+`Enter` submits, while `Alt-Enter` inserts a line break in either input.
+Multiline clipboard pastes are inserted as text (including blank and trailing
+lines), not interpreted as review commands. The request-changes summary footer
+grows for its explicit lines. `Esc` closes the input, `Ctrl-T` cycles a comment
+tag, and `Ctrl-C` cancels the review.
 
 ![The comment box open on a selected line, with commit, tag, and cancel chips](img/annotate-box.png)
 

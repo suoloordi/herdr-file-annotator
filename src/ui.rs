@@ -15,8 +15,9 @@ use anyhow::Result;
 use crossterm::{
     cursor,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -130,6 +131,10 @@ pub fn run(
                     return Ok(outcome);
                 }
             }
+            Event::Paste(text) => {
+                let size = terminal.size()?;
+                app.handle_paste(&text, size);
+            }
             Event::Mouse(mouse) => {
                 let size = terminal.size()?;
                 app.handle_mouse(mouse, size);
@@ -169,14 +174,26 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            cursor::Hide,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         Ok(TermGuard)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            cursor::Show,
+            LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -1604,6 +1621,20 @@ impl<'a> App<'a> {
         })
     }
 
+    /// Insert a bracketed-paste payload into an active text input.
+    ///
+    /// Pasted text must never be replayed as review keybindings: a newline in
+    /// a paste is content, while an Enter key submits the current input.
+    fn handle_paste(&mut self, text: &str, term_size: Size) {
+        let Some(mode) = self.input.as_mut() else { return };
+        match mode {
+            InputMode::Summary { editor } | InputMode::Comment { editor, .. } => {
+                editor.insert_str(text);
+            }
+        }
+        self.ensure_cursor_visible(term_size);
+    }
+
     /// Handle one key event. Returns `Some(outcome)` once the reviewer has
     /// made a final decision (approve / request changes / cancel).
     fn handle_key(&mut self, key: KeyEvent, term_size: Size) -> Option<Outcome> {
@@ -1626,8 +1657,8 @@ impl<'a> App<'a> {
             match &mut mode {
                 InputMode::Summary { editor } => match key.code {
                     _ if submits_input(&key) => {
-                        let text = input_text(editor).trim().to_string();
-                        let summary = if text.is_empty() { None } else { Some(text) };
+                        let text = input_text(editor);
+                        let summary = (!text.trim().is_empty()).then_some(text);
                         outcome = Some(Outcome {
                             verdict: Verdict::RequestChanges,
                             summary,
@@ -1652,8 +1683,8 @@ impl<'a> App<'a> {
                     // Same ctrl+j guard as the summary arm above.
                     KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     _ if submits_input(&key) => {
-                        let text = input_text(editor).trim().to_string();
-                        if !text.is_empty() {
+                        let text = input_text(editor);
+                        if !text.trim().is_empty() {
                             match *editing {
                                 // Editing keeps the original file/range/side
                                 // — only the comment and tag change. Rebuilding
@@ -6720,6 +6751,48 @@ mod tests {
             matches!(&app.input, Some(InputMode::Comment { editor, .. }) if input_text(editor) == "?"),
             "expected the literal `?` to land in the still-open comment buffer"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_comment_without_triggering_commands() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.diff.cursor = 1;
+        let size = Size::new(120, 40);
+        let pasted = "first\n\nsecond\nthird\n\n";
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        app.handle_paste(pasted, size);
+
+        assert!(app.pending.is_empty());
+        assert!(matches!(
+            &app.input,
+            Some(InputMode::Comment { editor, .. }) if input_text(editor) == pasted
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].annotation.comment, pasted);
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_request_changes_summary() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        let pasted = "first\n\nsecond\nthird\n\n";
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
+
+        app.handle_paste(pasted, size);
+        assert_eq!(app.footer_rows(), 6);
+
+        let outcome = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size)
+            .expect("Enter submits the summary");
+        assert_eq!(outcome.summary.as_deref(), Some(pasted));
     }
 
     #[test]
