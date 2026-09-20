@@ -42,7 +42,7 @@ noise.
 *frozen* until your verdict (approve, request changes, or cancel) so
 nothing runs past your review.
 
-Also in the box: full mouse support, syntax-highlighted diffs (TypeScript/TSX included via bundled grammars — syntect's defaults ship none), code folding
+Also in the box: full mouse support, syntax-highlighted diffs in 200+ languages (TypeScript, TSX, Svelte, Vue, Terraform and everything else in bat's curated grammar set), code folding
 (fold a long file to just the parts that matter — by hand, or driven by the
 agent as it explains), a `?` key-reference overlay, one-command install with
 checksum-verified binaries, and an agent that can never be wedged by a
