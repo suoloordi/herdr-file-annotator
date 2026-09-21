@@ -49,11 +49,14 @@ pub struct Outcome {
 }
 
 /// Syntax highlighting resources: a syntax set (language grammars) and a
-/// single fixed theme. Built once (`SyntaxSet::load_defaults_newlines` and
-/// `ThemeSet::load_defaults` are both nontrivial parses) and reused for the
-/// lifetime of the process via `OnceLock`, rather than being threaded
-/// through as owned state on `App` (which would tangle `App`'s lifetime
-/// with the highlighter's).
+/// single fixed theme. Built once (the syntax-set and theme loads are both
+/// nontrivial parses) and reused for the lifetime of the process via
+/// `OnceLock`, rather than being threaded through as owned state on `App`
+/// (which would tangle `App`'s lifetime with the highlighter's).
+///
+/// The grammars come from `two_face`, bat's curated syntax set precompiled
+/// for syntect — syntect's own default set predates TypeScript and several
+/// other languages that would otherwise fall back to plain text.
 struct Highlighter {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -63,7 +66,7 @@ static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
 
 fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(|| {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax_set = two_face::syntax::extra_newlines();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set.themes["base16-eighties.dark"].clone();
         Highlighter { syntax_set, theme }
@@ -6153,6 +6156,64 @@ mod tests {
             fgs.iter().all(|fg| matches!(fg, Some(Color::Rgb(..)))),
             "expected RGB foregrounds from syntect, got {fgs:?}"
         );
+        assert!(
+            fgs.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "expected more than one distinct token color, got {fgs:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_extensions_resolve_to_real_grammars_not_plain_text() {
+        // syntect's own default set ships no TypeScript grammar; these
+        // resolutions come from the two_face extra set. Pin the grammar
+        // names, not just "not plain text", so an upstream reshuffle that
+        // steals an extension fails loudly here instead of silently
+        // changing colors.
+        let hl = highlighter();
+        assert_eq!(syntax_for_path(hl, "src/app.ts").name, "TypeScript");
+        assert_eq!(syntax_for_path(hl, "src/comp.tsx").name, "TypeScriptReact");
+        // A sample of other two_face-only languages reviewers hit in
+        // practice — each was plain text under the syntect defaults.
+        assert_eq!(syntax_for_path(hl, "App.svelte").name, "Svelte");
+        assert_eq!(syntax_for_path(hl, "App.vue").name, "Vue Component");
+        assert_eq!(syntax_for_path(hl, "main.tf").name, "Terraform");
+        // And the defaults' own grammars still resolve through the
+        // superset — swapping sets must not regress existing languages.
+        assert_eq!(syntax_for_path(hl, "src/lib.rs").name, "Rust");
+    }
+
+    #[test]
+    fn highlighted_ts_add_line_is_polychrome() {
+        // End-to-end proof the TypeScript grammar actually tokenizes:
+        // a keyword-carrying line renders with more than one token color
+        // (plain-text fallback would be monochrome).
+        let file = FileDiff {
+            path: "src/app.ts".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".to_string(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![line(Origin::Add, None, Some(2), "const x: number = 1;")],
+            }],
+        };
+
+        let rows = highlight_file_rows(highlighter(), &file);
+        assert_eq!(rows.len(), 2);
+        let add_line = &rows[1];
+        let content: String =
+            add_line.spans[2..].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "const x: number = 1;");
+        for span in &add_line.spans[2..] {
+            assert_eq!(span.style.bg, Some(ADD_BG));
+        }
+        let fgs: Vec<_> = add_line.spans[2..].iter().map(|s| s.style.fg).collect();
         assert!(
             fgs.iter().collect::<std::collections::HashSet<_>>().len() > 1,
             "expected more than one distinct token color, got {fgs:?}"
