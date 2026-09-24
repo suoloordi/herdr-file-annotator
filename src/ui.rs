@@ -1611,6 +1611,11 @@ impl<'a> App<'a> {
                         close = true;
                     }
                     KeyCode::Esc => close = true,
+                    // Raw-mode terminals deliver ctrl+j as Char('j')+CONTROL,
+                    // and tui-textarea's default binding for it empties the
+                    // line — swallow it so an Emacs newline reflex cannot
+                    // wipe the text (Enter is how these inputs submit).
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     _ => {
                         editor.input(key);
                     }
@@ -1619,6 +1624,8 @@ impl<'a> App<'a> {
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         *tag = Tag::next(*tag);
                     }
+                    // Same ctrl+j guard as the summary arm above.
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     KeyCode::Enter => {
                         let text = input_text(editor).trim().to_string();
                         if !text.is_empty() {
@@ -6692,6 +6699,36 @@ mod tests {
 
         assert_eq!(app.pending.len(), 1);
         assert_eq!(app.pending[0].annotation.comment, ">alpha Xbeta");
+    }
+
+    #[test]
+    fn ctrl_j_is_inert_in_the_input_boxes_instead_of_clearing_them() {
+        // Raw-mode terminals deliver ctrl+j as Char('j')+CONTROL, and
+        // tui-textarea's default binding for it empties the line — an
+        // Emacs newline reflex must not wipe the reviewer's text.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.diff.cursor = 1;
+        let size = Size::new(120, 40);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "alpha".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), size);
+        assert!(
+            matches!(&app.input, Some(InputMode::Comment { editor, .. }) if input_text(editor) == "alpha"),
+            "ctrl+j must leave the comment text untouched"
+        );
+
+        app.input = Some(InputMode::Summary { editor: input_editor("beta".to_string()) });
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), size);
+        assert!(
+            matches!(&app.input, Some(InputMode::Summary { editor }) if input_text(editor) == "beta"),
+            "ctrl+j must leave the summary text untouched"
+        );
     }
 
     #[test]
