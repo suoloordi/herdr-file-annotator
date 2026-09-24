@@ -30,6 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use syntect::easy::HighlightLines;
+use tui_textarea::{CursorMove, TextArea};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -717,12 +718,11 @@ fn tag_color(tag: Option<&str>) -> Color {
 
 /// What the "request changes" / "comment" input bar is doing right now.
 enum InputMode {
-    /// The "request changes" summary prompt (unchanged from M2's `input:
-    /// Option<String>`, just relocated into this enum).
-    Summary { buf: String },
+    /// The request-changes summary prompt.
+    Summary { editor: TextArea<'static> },
     /// The annotation comment prompt, opened by `c` in diff focus.
     Comment {
-        buf: String,
+        editor: TextArea<'static>,
         tag: Option<Tag>,
         /// `Some(idx)` when editing an existing `pending[idx]` rather than
         /// creating a new annotation.
@@ -731,6 +731,25 @@ enum InputMode {
         row_start: usize,
         row_end: usize,
     },
+}
+
+/// A single-line editor with tui-textarea's default Emacs-style bindings.
+fn input_editor(text: String) -> TextArea<'static> {
+    let mut editor = TextArea::new(vec![text]);
+    editor.move_cursor(CursorMove::End);
+    editor
+}
+
+fn input_text<'a>(editor: &'a TextArea<'static>) -> &'a str {
+    editor.lines().first().map(String::as_str).unwrap_or_default()
+}
+
+/// Insert the visible caret at tui-textarea's character-wise cursor position.
+fn input_display_text(editor: &TextArea<'static>) -> String {
+    let text = input_text(editor);
+    let (_, col) = editor.cursor();
+    let at = text.char_indices().nth(col).map(|(idx, _)| idx).unwrap_or(text.len());
+    format!("{}\u{258f}{}", &text[..at], &text[at..])
 }
 
 /// An annotation the reviewer has left but not yet submitted with a verdict.
@@ -1580,9 +1599,9 @@ impl<'a> App<'a> {
             let mut close = false;
             let mut outcome = None;
             match &mut mode {
-                InputMode::Summary { buf } => match key.code {
+                InputMode::Summary { editor } => match key.code {
                     KeyCode::Enter => {
-                        let text = buf.trim().to_string();
+                        let text = input_text(editor).trim().to_string();
                         let summary = if text.is_empty() { None } else { Some(text) };
                         outcome = Some(Outcome {
                             verdict: Verdict::RequestChanges,
@@ -1592,20 +1611,23 @@ impl<'a> App<'a> {
                         close = true;
                     }
                     KeyCode::Esc => close = true,
-                    KeyCode::Backspace => {
-                        buf.pop();
+                    // Raw-mode terminals deliver ctrl+j as Char('j')+CONTROL,
+                    // and tui-textarea's default binding for it empties the
+                    // line — swallow it so an Emacs newline reflex cannot
+                    // wipe the text (Enter is how these inputs submit).
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+                    _ => {
+                        editor.input(key);
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        buf.push(c)
-                    }
-                    _ => {}
                 },
-                InputMode::Comment { buf, tag, editing, row_start, row_end } => match key.code {
+                InputMode::Comment { editor, tag, editing, row_start, row_end } => match key.code {
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         *tag = Tag::next(*tag);
                     }
+                    // Same ctrl+j guard as the summary arm above.
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     KeyCode::Enter => {
-                        let text = buf.trim().to_string();
+                        let text = input_text(editor).trim().to_string();
                         if !text.is_empty() {
                             match *editing {
                                 // Editing keeps the original file/range/side
@@ -1655,13 +1677,9 @@ impl<'a> App<'a> {
                         close = true;
                     }
                     KeyCode::Esc => close = true,
-                    KeyCode::Backspace => {
-                        buf.pop();
+                    _ => {
+                        editor.input(key);
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        buf.push(c)
-                    }
-                    _ => {}
                 },
             }
             if !close {
@@ -1737,7 +1755,7 @@ impl<'a> App<'a> {
                 });
             }
             Some(Action::RequestChanges) => {
-                self.input = Some(InputMode::Summary { buf: String::new() });
+                self.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
                 return None;
             }
             Some(Action::ToggleFiles) => {
@@ -1966,9 +1984,9 @@ impl<'a> App<'a> {
             let h = comment_height(p.annotation.tag.as_deref(), &p.annotation.comment, inner_width);
             ends.extend(std::iter::repeat(row_end).take(h));
         }
-        if let Some(InputMode::Comment { buf, row_end, .. }) = &self.input {
+        if let Some(InputMode::Comment { editor, row_end, .. }) = &self.input {
             // Both a fresh comment and an edit weave the box (new AND edit).
-            let h = editing_box_height(buf, inner_width);
+            let h = editing_box_height(&input_display_text(editor), inner_width);
             ends.extend(std::iter::repeat(*row_end).take(h));
         }
         // Wrap-mode continuation lines are extras exactly like comment
@@ -2268,7 +2286,7 @@ impl<'a> App<'a> {
         }
         if let Some(anchor) = self.visual_anchor.take() {
             self.input = Some(InputMode::Comment {
-                buf: String::new(),
+                editor: input_editor(String::new()),
                 tag: None,
                 editing: None,
                 row_start: anchor.min(cursor),
@@ -2283,7 +2301,7 @@ impl<'a> App<'a> {
             let (row_start, row_end) = self.pending_anchor(idx).unwrap_or((cursor, cursor));
             let p = &self.pending[idx];
             self.input = Some(InputMode::Comment {
-                buf: p.annotation.comment.clone(),
+                editor: input_editor(p.annotation.comment.clone()),
                 tag: p.annotation.tag.as_deref().and_then(Tag::from_label),
                 editing: Some(idx),
                 row_start,
@@ -2293,7 +2311,7 @@ impl<'a> App<'a> {
         }
 
         self.input = Some(InputMode::Comment {
-            buf: String::new(),
+            editor: input_editor(String::new()),
             tag: None,
             editing: None,
             row_start: cursor,
@@ -2932,11 +2950,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = match &app.input {
         // Input bars keep the END of a long buffer visible (that's where the
         // caret is) by trimming from the left with an ellipsis.
-        Some(InputMode::Summary { buf }) => summary_footer_text(buf, area.width as usize),
-        Some(InputMode::Comment { buf, tag, .. }) => {
+        Some(InputMode::Summary { editor }) => {
+            summary_footer_text(&input_display_text(editor), area.width as usize)
+        }
+        Some(InputMode::Comment { editor, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
             let label = format!(" comment [tag: {tag_label}]: ");
-            format!("{label}{}", tail_fit(buf, (area.width as usize).saturating_sub(label.chars().count())))
+            format!(
+                "{label}{}",
+                tail_fit(
+                    &input_display_text(editor),
+                    (area.width as usize).saturating_sub(label.chars().count()),
+                )
+            )
         }
         None => {
             let context = match app.focus {
@@ -3279,9 +3305,10 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
             inner_width,
         ));
     }
-    if let Some(InputMode::Comment { buf, tag, row_end, .. }) = &app.input {
+    if let Some(InputMode::Comment { editor, tag, row_end, .. }) = &app.input {
+        let text = input_display_text(editor);
         groups.entry(folded_row(*row_end)).or_default().extend(editing_box_lines(
-            buf,
+            &text,
             *tag,
             inner_width,
         ));
@@ -3513,9 +3540,8 @@ fn editing_box_height(buf: &str, inner_width: usize) -> usize {
 }
 
 /// Build the annot-style dashed editing box: a top rule, one content row per
-/// wrapped line of `buf` (with a typing caret on the last row — an empty
-/// buffer still renders one row, just the caret), and a bottom rule carrying
-/// the commit/tag/cancel button chips.
+/// wrapped line of its already caret-marked input text, and a bottom rule
+/// carrying the commit/tag/cancel button chips.
 fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Line<'static>> {
     // NOT `.max(4)`: the box must fit the pane it's actually drawn into, not
     // a hypothetical wider one — forcing a wider width here just moves the
@@ -3533,23 +3559,18 @@ fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Lin
         rule_style,
     )));
 
-    // Content rows: ┆ <text, padded> ┆ — the caret occupies the one spare
-    // column `editing_wrap_width` reserves beyond the wrapped text.
+    // Content rows: ┆ <text, padded> ┆. The display text already includes
+    // the caret at tui-textarea's current cursor position.
     let wrap_width = editing_wrap_width(width);
     let middle_width = wrap_width + 1;
     let chunks = wrap_comment(buf, wrap_width);
-    let last = chunks.len() - 1;
-    for (i, chunk) in chunks.into_iter().enumerate() {
+    for chunk in chunks {
         let mut middle = chunk;
         // Display columns, not chars: a chunk of wide (e.g. CJK) glyphes has
         // fewer chars than the columns it renders as, so char-counting here
         // under-pads and pushes the closing border past the box's actual
         // width.
-        let mut used = str_cols(&middle);
-        if i == last {
-            middle.push('\u{258f}'); // typing caret
-            used += str_cols("\u{258f}");
-        }
+        let used = str_cols(&middle);
         if used < middle_width {
             middle.push_str(&" ".repeat(middle_width - used));
         }
@@ -5266,7 +5287,7 @@ mod tests {
         let size = Size::new(80, 24);
         app.diff.cursor = 1;
         // Reviewer is mid-comment: the input bar is open.
-        app.input = Some(InputMode::Summary { buf: String::new() });
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
 
         // A goto arrives while typing — must not move the cursor or disturb
         // the open input, but must not be lost either.
@@ -5292,7 +5313,7 @@ mod tests {
         let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
         let mut app = App::new(&request, &model);
         let size = Size::new(80, 24);
-        app.input = Some(InputMode::Summary { buf: String::new() });
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
 
         // The agent's focus push arrives first and is held...
         app.apply_goto(
@@ -5329,7 +5350,7 @@ mod tests {
         let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file(), other] });
         let mut app = App::new(&request, &model);
         let size = Size::new(80, 24);
-        app.input = Some(InputMode::Summary { buf: String::new() });
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
 
         app.apply_goto(
             &GotoTarget { file: "src/lib.rs".into(), line: 10, view: None, focus: Some(vec![lr(10, 15)]) },
@@ -6550,9 +6571,9 @@ mod tests {
         // it, so this must open in edit mode, prefilled.
         assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size).is_none());
         match &app.input {
-            Some(InputMode::Comment { editing, buf, .. }) => {
+            Some(InputMode::Comment { editing, editor, .. }) => {
                 assert_eq!(*editing, Some(0));
-                assert_eq!(buf, "first");
+                assert_eq!(input_text(editor), "first");
             }
             other => panic!("expected comment input in edit mode, got a different state (variant present: {})", other.is_some()),
         }
@@ -6639,7 +6660,7 @@ mod tests {
         let mut app = App::new(&request, &model);
         app.focus = Focus::Diff;
         app.input = Some(InputMode::Comment {
-            buf: String::new(),
+            editor: input_editor(String::new()),
             tag: None,
             editing: None,
             row_start: 0,
@@ -6650,8 +6671,63 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), size).is_none());
         assert!(!app.help_open, "`?` must not open the overlay while an input bar is open");
         assert!(
-            matches!(&app.input, Some(InputMode::Comment { buf, .. }) if buf == "?"),
+            matches!(&app.input, Some(InputMode::Comment { editor, .. }) if input_text(editor) == "?"),
             "expected the literal `?` to land in the still-open comment buffer"
+        );
+    }
+
+    #[test]
+    fn input_boxes_delegate_default_emacs_bindings_to_tui_textarea() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.diff.cursor = 1;
+        let size = Size::new(120, 40);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "alpha beta".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        // tui-textarea owns its default bindings: alt+b moves back a word,
+        // while ctrl+a still moves to the start of this single-line input.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].annotation.comment, ">alpha Xbeta");
+    }
+
+    #[test]
+    fn ctrl_j_is_inert_in_the_input_boxes_instead_of_clearing_them() {
+        // Raw-mode terminals deliver ctrl+j as Char('j')+CONTROL, and
+        // tui-textarea's default binding for it empties the line — an
+        // Emacs newline reflex must not wipe the reviewer's text.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.diff.cursor = 1;
+        let size = Size::new(120, 40);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "alpha".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), size);
+        assert!(
+            matches!(&app.input, Some(InputMode::Comment { editor, .. }) if input_text(editor) == "alpha"),
+            "ctrl+j must leave the comment text untouched"
+        );
+
+        app.input = Some(InputMode::Summary { editor: input_editor("beta".to_string()) });
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), size);
+        assert!(
+            matches!(&app.input, Some(InputMode::Summary { editor }) if input_text(editor) == "beta"),
+            "ctrl+j must leave the summary text untouched"
         );
     }
 
@@ -6704,8 +6780,7 @@ mod tests {
             let height = editing_box_height(buf, width);
             let lines = editing_box_lines(buf, Some(Tag::Fix), width);
             assert_eq!(height, lines.len(), "buf={buf:?} width={width}");
-            // Always at least the two rules plus one content row (even for
-            // an empty buffer, which still renders a caret-only row).
+            // Always at least the two rules plus one content row.
             assert!(height >= 3);
         }
     }
@@ -6760,7 +6835,7 @@ mod tests {
         assert_eq!(app.editing_annotation_idx(), None, "no input open: nothing is being edited");
 
         app.input = Some(InputMode::Comment {
-            buf: String::new(),
+            editor: input_editor(String::new()),
             tag: None,
             editing: None,
             row_start: 0,
@@ -6773,7 +6848,7 @@ mod tests {
         );
 
         app.input = Some(InputMode::Comment {
-            buf: String::new(),
+            editor: input_editor(String::new()),
             tag: None,
             editing: Some(2),
             row_start: 0,
@@ -6781,7 +6856,7 @@ mod tests {
         });
         assert_eq!(app.editing_annotation_idx(), Some(2));
 
-        app.input = Some(InputMode::Summary { buf: String::new() });
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
         assert_eq!(app.editing_annotation_idx(), None, "the summary bar is a different input mode entirely");
     }
 
@@ -6813,7 +6888,9 @@ mod tests {
 
         // Open edit mode on that same annotation (at its anchor row).
         app.input = Some(InputMode::Comment {
-            buf: "editing now, with a much longer replacement comment".to_string(),
+            editor: input_editor(
+                "editing now, with a much longer replacement comment".to_string(),
+            ),
             tag: Some(Tag::Fix),
             editing: Some(0),
             row_start: 2,
@@ -7079,9 +7156,9 @@ mod tests {
         app.diff.cursor = 1;
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
         match &app.input {
-            Some(InputMode::Comment { editing, buf, .. }) => {
+            Some(InputMode::Comment { editing, editor, .. }) => {
                 assert_eq!(*editing, Some(0));
-                assert_eq!(buf, "note");
+                assert_eq!(input_text(editor), "note");
             }
             other => panic!(
                 "expected comment input in edit mode, got a different state (variant present: {})",
