@@ -3098,13 +3098,30 @@ fn slim_footer_text(context: &str, keymap: &Keymap, width: usize) -> String {
     tail_fit(&ctx_only, width)
 }
 
+/// Rows the input bar must scroll so its caret stays visible: the bar is
+/// sized one row per input line, but the layout only ever gives it the rows
+/// the terminal can spare, and a `Paragraph` paints from line 0.
+fn footer_scroll(editor: &TextArea<'static>, height: u16) -> u16 {
+    let window = height.max(1) as usize;
+    editor.cursor().0.saturating_sub(window - 1).min(u16::MAX as usize) as u16
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    // Rows the bar will skip; the prompt rides the top visible row so it
+    // scrolls with the text instead of disappearing with line 0.
+    let scroll = match &app.input {
+        Some(InputMode::Summary { editor } | InputMode::Comment { editor, .. }) => {
+            footer_scroll(editor, area.height)
+        }
+        None => 0,
+    };
+    let top = scroll as usize;
     let lines: Vec<Line> = match &app.input {
         Some(InputMode::Summary { editor }) => input_display_text(editor)
             .split('\n')
             .enumerate()
             .map(|(row, text)| {
-                if row == 0 {
+                if row == top {
                     Line::raw(summary_footer_text(text, area.width as usize))
                 } else {
                     Line::raw(tail_fit(text, area.width as usize))
@@ -3119,9 +3136,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 .split('\n')
                 .enumerate()
                 .map(|(row, text)| {
-                    // Only the first row pays for the label; continuation rows
+                    // Only the top visible row pays for the label; the others
                     // get the bar's full width so a long line stays readable.
-                    if row == 0 {
+                    if row == top {
                         let avail = (area.width as usize).saturating_sub(label_cols);
                         Line::raw(format!("{label}{}", tail_fit(text, avail)))
                     } else {
@@ -3138,7 +3155,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             vec![Line::raw(slim_footer_text(&context, &app.keymap, area.width as usize))]
         }
     };
-    let footer = Paragraph::new(lines).style(Style::default().add_modifier(Modifier::REVERSED));
+    let footer = Paragraph::new(lines)
+        .style(Style::default().add_modifier(Modifier::REVERSED))
+        .scroll((scroll, 0));
     frame.render_widget(footer, area);
 }
 
@@ -4875,6 +4894,85 @@ mod tests {
         assert_eq!(wrap_comment("first\n\nlast", 20), vec!["first", "", "last"]);
         // Empty text still occupies one row (the live preview's empty state).
         assert_eq!(wrap_comment("", 10), vec![""]);
+    }
+
+    #[test]
+    fn summary_bar_scrolls_to_keep_the_caret_visible() {
+        // The summary bar is the ONLY view of that text — a comment also has
+        // its box woven into the diff, a summary has nothing — and it is
+        // sized a row per input line while the layout can only hand it the
+        // rows the terminal spares. Without a scroll offset the trailing
+        // lines were dropped and no key could bring them back: the caret was
+        // simply nowhere on screen until you walked back up into view.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let term = Size::new(100, 12);
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
+        let payload: String = (0..12)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_paste(&payload, term);
+
+        let footer_rect = |app: &App| -> Rect {
+            // The real bar rect, i.e. what `draw`'s own layout hands it —
+            // `body_rects` takes the UNCLAMPED row count and would collapse
+            // the body here, since the solver only gives the bar h - 3.
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(app.footer_rows()),
+                ])
+                .split(Rect::new(0, 0, term.width, term.height))[3]
+        };
+        let bar_rows = footer_rect(&app).height as usize;
+        assert!(
+            app.footer_rows() as usize > bar_rows,
+            "fixture must want more rows than the bar can get ({} vs {bar_rows})",
+            app.footer_rows()
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let bar = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let rect = footer_rect(app);
+            (rect.y..rect.y + rect.height)
+                .map(|y| (0..term.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect()
+        };
+
+        // Pasted at the end of a 12-line summary: the caret sits on the LAST
+        // line, which only a scroll offset can reach.
+        let rows = bar(&app, &mut terminal);
+        let text = rows.join("\n");
+        assert!(text.contains("line 11"), "the caret's line must show:\n{text}");
+        assert!(text.contains(CARET), "with its caret on screen:\n{text}");
+        assert!(
+            !text.contains("line 00"),
+            "the leading lines are what the window scrolled off:\n{text}"
+        );
+
+        // Walking up must keep the caret's line in view, and the prompt must
+        // ride the top visible row rather than scroll away with line 0.
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), term);
+        }
+        let rows = bar(&app, &mut terminal);
+        let text = rows.join("\n");
+        assert!(text.contains("line 06"), "the caret's line must show:\n{text}");
+        assert!(text.contains(CARET), "with its caret on screen:\n{text}");
+        assert!(
+            rows[0].contains("request changes"),
+            "the prompt belongs on the top visible row, was {:?}",
+            rows[0]
+        );
     }
 
     #[test]
