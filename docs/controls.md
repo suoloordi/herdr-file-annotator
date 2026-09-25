@@ -61,7 +61,7 @@ the [configuration](configuration.md).
 | `v` | start a line-range selection (extend with `j` / `k`) |
 | `c` | open the comment box for the selection (or the cursor line) |
 | `Ctrl-T` | cycle the tag: none / `verify` / `fix` / `question` / `nit` |
-| `Enter` | save the annotation |
+| `Enter` | save the annotation (use `Alt+Enter` to insert a new line) |
 | `Esc` | back out without saving |
 | `c` on an annotated line | edit the existing annotation |
 | `x` | delete the annotation under the cursor |
