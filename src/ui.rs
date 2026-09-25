@@ -1024,9 +1024,7 @@ fn body_rects(
     nav_width: u16,
     footer_rows: u16,
 ) -> (Rect, Rect) {
-    let chrome = 2u16.saturating_add(footer_rows);
-    let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(chrome));
-    body_split(body, show_navigator, nav_width)
+    body_split(screen_rows(term_size, footer_rows)[2], show_navigator, nav_width)
 }
 
 /// Inner (borderless) width of the diff pane — the wrap width for inline
@@ -2262,9 +2260,22 @@ impl<'a> App<'a> {
             }
             return;
         }
-        // While an input bar is open the keyboard owns the interaction;
-        // stray clicks/scrolls shouldn't move state under the typed comment.
+        // While an input is open the keyboard owns the interaction; only the
+        // wheel — over the bar, or over a comment's box in the diff — still
+        // moves it. Clicks stay inert.
         if self.input.is_some() {
+            let bar = screen_rows(term_size, self.footer_rows())[3];
+            let (_, diff_rect) =
+                body_rects(term_size, self.show_navigator, self.nav_width, self.footer_rows());
+            let over_box = matches!(self.input, Some(InputMode::Comment { .. }))
+                && rect_contains(diff_rect, mouse.column, mouse.row);
+            if over_box || rect_contains(bar, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => self.wheel_input(true, term_size),
+                    MouseEventKind::ScrollUp => self.wheel_input(false, term_size),
+                    _ => {}
+                }
+            }
             return;
         }
         let (nav_rect, diff_rect) =
@@ -2363,6 +2374,22 @@ impl<'a> App<'a> {
     /// Wheel over the diff: move the viewport, and drag the cursor along
     /// only when it would leave the visible area (editor-style), so plain
     /// reading scrolls never disturb the cursor.
+    /// One wheel tick over the open input (its bar, or a comment's box in
+    /// the diff): walk the caret a row, which is what both windows are
+    /// derived from — the same trick `wheel_diff` plays on the diff cursor.
+    fn wheel_input(&mut self, down: bool, term_size: Size) {
+        let Some(InputMode::Summary { editor } | InputMode::Comment { editor, .. }) =
+            self.input.as_mut()
+        else {
+            return;
+        };
+        // `CursorMove` keeps the column, so this is a plain vertical step and
+        // it clamps at the buffer's first and last row on its own.
+        editor.move_cursor(if down { CursorMove::Down } else { CursorMove::Up });
+        // A comment box is woven into the diff, so its caret moved too.
+        self.ensure_cursor_visible(term_size);
+    }
+
     fn wheel_diff(&mut self, down: bool, term_size: Size) {
         let base_count = self.view_row_count();
         if base_count == 0 {
@@ -2857,7 +2884,7 @@ impl<'a> App<'a> {
                 name: "Mouse",
                 current: false,
                 rows: vec![
-                    HelpRow::new("wheel", "scroll the files or the diff"),
+                    HelpRow::new("wheel", "scroll the files, the diff, or an open input"),
                     HelpRow { key: "horiz. wheel".to_string(), desc: format!("pan the diff{pan_note}") },
                     HelpRow::new("click", "select a file / move the cursor"),
                     HelpRow::new("drag", "select a range in the diff"),
@@ -3007,17 +3034,24 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, rect);
 }
 
-fn draw(frame: &mut Frame, app: &App) {
-    let area = frame.area();
+/// The screen's four bands in `draw`'s order, so drawing and hit testing
+/// agree on what the layout gives the body and the input bar.
+fn screen_rows(term_size: Size, footer_rows: u16) -> [Rect; 4] {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
             Constraint::Length(1), // note
             Constraint::Min(1),    // body
-            Constraint::Length(app.footer_rows()),
+            Constraint::Length(footer_rows),
         ])
-        .split(area);
+        .split(Rect::new(0, 0, term_size.width, term_size.height));
+    [rows[0], rows[1], rows[2], rows[3]]
+}
+
+fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let rows = screen_rows(Size { width: area.width, height: area.height }, app.footer_rows());
 
     draw_header(frame, rows[0], app.request);
     draw_note(frame, rows[1], app.request, app.pending.len());
@@ -4973,6 +5007,162 @@ mod tests {
             "the prompt belongs on the top visible row, was {:?}",
             rows[0]
         );
+    }
+
+    #[test]
+    fn wheel_over_the_open_input_bar_walks_the_caret_so_it_scrolls() {
+        // While an input is open the mouse is otherwise inert — clicks and
+        // scrolls must not move state under the typed text — but the wheel
+        // OVER the bar scrolls it. The bar's window is derived from the
+        // caret, so a tick walks the caret, the same way `wheel_diff` drags
+        // the diff cursor into the window it just moved.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let term = Size::new(100, 12);
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
+        let payload: String = (0..12)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_paste(&payload, term);
+
+        let caret = |app: &App| match app.input.as_ref() {
+            Some(InputMode::Summary { editor } | InputMode::Comment { editor, .. }) => {
+                editor.cursor().0
+            }
+            None => usize::MAX,
+        };
+        assert_eq!(caret(&app), 11, "the paste leaves the caret on the last line");
+
+        let bar = screen_rows(term, app.footer_rows())[3];
+        assert!(
+            bar.height < app.footer_rows(),
+            "fixture must leave the bar shorter than its buffer"
+        );
+        let (_, diff_rect) =
+            body_rects(term, app.show_navigator, app.nav_width, app.footer_rows());
+
+        // Over the bar: one row per tick, both directions.
+        for _ in 0..3 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, bar.x + 1, bar.y + 1), term);
+        }
+        assert_eq!(caret(&app), 8, "three ticks up walk the caret up three lines");
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, bar.x + 1, bar.y), term);
+        assert_eq!(caret(&app), 9, "and a tick down walks it back");
+
+        // Walking past the top clamps on the buffer's first line.
+        for _ in 0..20 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, bar.x + 1, bar.y + 1), term);
+        }
+        assert_eq!(caret(&app), 0, "the wheel clamps at the first line");
+
+        // And the window followed: the first line is on screen, caret and all.
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let band: String = (bar.y..bar.y + bar.height)
+            .map(|y| (0..term.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(band.contains("line 00"), "the scrolled-to line must show:\n{band}");
+        assert!(band.contains(CARET), "with the caret riding along:\n{band}");
+
+        // Elsewhere — over the diff, or any click — stays inert.
+        let before = caret(&app);
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, diff_rect.x + 1, diff_rect.y), term);
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), bar.x + 1, bar.y + 1),
+            term,
+        );
+        assert_eq!(caret(&app), before, "only the wheel over the bar moves the caret");
+    }
+
+    #[test]
+    fn wheel_over_the_woven_comment_box_walks_its_caret_too() {
+        // A comment is on screen twice: woven into the diff pane as a box and
+        // again in the bar. The pointer is usually over the box (it's the big
+        // one), so the wheel has to work there as well — and since the box's
+        // window is caret-derived too, a tick walks the same caret, which
+        // scrolls the box AND the bar together.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let term = Size::new(100, 20);
+        app.diff.cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), term);
+        let payload: String = (0..12)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_paste(&payload, term);
+
+        let caret = |app: &App| match app.input.as_ref() {
+            Some(InputMode::Comment { editor, .. }) => editor.cursor().0,
+            _ => usize::MAX,
+        };
+        assert_eq!(caret(&app), 11, "the paste leaves the caret on the last line");
+
+        let (_, diff_rect) =
+            body_rects(term, app.show_navigator, app.nav_width, app.footer_rows());
+        let map = app.disp_map(diff_inner_width(term, app.show_navigator, app.nav_width));
+        let viewport =
+            diff_viewport_rows(term, app.show_navigator, app.nav_width, app.footer_rows());
+        assert!(
+            map.extra_at(app.diff.cursor) + 1 > viewport,
+            "fixture must weave a box taller than the pane (span={}, viewport={viewport})",
+            map.extra_at(app.diff.cursor) + 1
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let pane = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let (_, diff_rect) =
+                body_rects(term, app.show_navigator, app.nav_width, app.footer_rows());
+            (diff_rect.y..diff_rect.y + diff_rect.height)
+                .map(|y| {
+                    (diff_rect.x..diff_rect.x + diff_rect.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            pane(&app, &mut terminal).contains(CARET),
+            "the box's caret starts on screen"
+        );
+
+        // Over the box: each tick walks the caret a row, and the box follows.
+        for _ in 0..3 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, diff_rect.x + 2, diff_rect.y + 1), term);
+        }
+        assert_eq!(caret(&app), 8, "three ticks up walk the caret up three lines");
+        let text = pane(&app, &mut terminal);
+        assert!(
+            text.contains("line 08") && text.contains(CARET),
+            "the box must have scrolled to the caret:\n{text}"
+        );
+
+        // The summary has no box in the diff, so the pointer there still
+        // decides nothing: only its bar responds.
+        app.input = Some(InputMode::Summary { editor: input_editor(String::new()) });
+        let before = input_caret_offset(match app.input.as_ref() {
+            Some(InputMode::Summary { editor }) => editor,
+            _ => unreachable!(),
+        });
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, diff_rect.x + 2, diff_rect.y + 1), term);
+        let after = input_caret_offset(match app.input.as_ref() {
+            Some(InputMode::Summary { editor }) => editor,
+            _ => unreachable!(),
+        });
+        assert_eq!(after, before, "the wheel over the diff must stay inert for a summary");
     }
 
     #[test]
