@@ -1657,8 +1657,8 @@ impl<'a> App<'a> {
             match &mut mode {
                 InputMode::Summary { editor } => match key.code {
                     _ if submits_input(&key) => {
-                        let text = input_text(editor);
-                        let summary = (!text.trim().is_empty()).then_some(text);
+                        let text = input_text(editor).trim().to_string();
+                        let summary = (!text.is_empty()).then_some(text);
                         outcome = Some(Outcome {
                             verdict: Verdict::RequestChanges,
                             summary,
@@ -1683,8 +1683,8 @@ impl<'a> App<'a> {
                     // Same ctrl+j guard as the summary arm above.
                     KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     _ if submits_input(&key) => {
-                        let text = input_text(editor);
-                        if !text.trim().is_empty() {
+                        let text = input_text(editor).trim().to_string();
+                        if !text.is_empty() {
                             match *editing {
                                 // Editing keeps the original file/range/side
                                 // — only the comment and tag change. Rebuilding
@@ -6774,7 +6774,9 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
         assert_eq!(app.pending.len(), 1);
-        assert_eq!(app.pending[0].annotation.comment, pasted);
+        // Submitting normalises the box's outer whitespace; interior newlines
+        // are content and survive.
+        assert_eq!(app.pending[0].annotation.comment, pasted.trim());
     }
 
     #[test]
@@ -6792,7 +6794,7 @@ mod tests {
         let outcome = app
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size)
             .expect("Enter submits the summary");
-        assert_eq!(outcome.summary.as_deref(), Some(pasted));
+        assert_eq!(outcome.summary.as_deref(), Some(pasted.trim()));
     }
 
     #[test]
