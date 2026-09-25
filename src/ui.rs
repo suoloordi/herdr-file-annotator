@@ -632,6 +632,11 @@ fn follow_display(scroll: usize, cursor: usize, map: &DispMap, viewport: usize) 
     let viewport = viewport.max(1);
     let dc = map.disp(cursor);
     let tail = dc + map.extra_at(cursor);
+    // A span taller than the viewport can't satisfy both rules below, so anchor
+    // on its tail; that keeps the span's bottom visible and is a fixed point.
+    if map.extra_at(cursor) + 1 > viewport {
+        return (tail + 1).saturating_sub(viewport);
+    }
     if dc < scroll {
         dc
     } else if tail >= scroll + viewport {
@@ -5064,6 +5069,55 @@ mod tests {
         let map = app.disp_map(diff_inner_width(size, app.show_navigator, app.nav_width));
         let dc = map.disp(app.diff.cursor);
         let tail = dc + map.extra_at(app.diff.cursor);
+        assert!(
+            tail < app.diff.scroll + viewport,
+            "box bottom (tail={tail}) must stay within the viewport (scroll={}, viewport={viewport})",
+            app.diff.scroll
+        );
+    }
+
+    #[test]
+    fn over_tall_comment_box_does_not_flicker_the_diff_scroll() {
+        // A comment box taller than the diff viewport used to flip
+        // `diff.scroll` between two values on every keypress: rule A ("snap
+        // up to the cursor row") and rule B ("pull the span's bottom into
+        // view") each undid the other, since a span larger than the viewport
+        // can satisfy neither. `follow_display` must be a fixed point.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(100, 46);
+
+        // Open the comment box near the top of the file and paste a payload
+        // far taller than the viewport can ever show at once.
+        app.diff.cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        let tall: String = (0..20).map(|n| format!("line {n}\n")).collect();
+        app.handle_paste(&tall, size);
+
+        let map = app.disp_map(diff_inner_width(size, app.show_navigator, app.nav_width));
+        let viewport =
+            diff_viewport_rows(size, app.show_navigator, app.nav_width, app.footer_rows());
+        assert!(
+            map.extra_at(app.diff.cursor) + 1 > viewport,
+            "fixture must produce a box taller than the viewport (span={}, viewport={viewport})",
+            map.extra_at(app.diff.cursor) + 1
+        );
+
+        // Each key runs `ensure_cursor_visible` again; the scroll must not
+        // move. F12 is unmapped, so this is a pure re-follow, not navigation.
+        let before = app.diff.scroll;
+        for press in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), size);
+            assert_eq!(
+                app.diff.scroll, before,
+                "keypress {press} moved the scroll with an over-tall box"
+            );
+        }
+
+        // And the box's bottom row must stay inside the window.
+        let tail = map.disp(app.diff.cursor) + map.extra_at(app.diff.cursor);
         assert!(
             tail < app.diff.scroll + viewport,
             "box bottom (tail={tail}) must stay within the viewport (scroll={}, viewport={viewport})",
