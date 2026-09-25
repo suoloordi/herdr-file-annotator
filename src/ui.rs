@@ -626,16 +626,38 @@ fn fold_pill_line(hidden_lines: usize, notes: usize) -> Line<'static> {
     ))
 }
 
-/// Display-space scroll follow: keep the cursor row AND any comment rows
-/// hanging under it inside the viewport. Pure so it's directly testable.
-fn follow_display(scroll: usize, cursor: usize, map: &DispMap, viewport: usize) -> usize {
+/// Display-space scroll follow: keep the anchor row AND any comment rows
+/// hanging under it inside the viewport. A span taller than the viewport can
+/// show neither both ends nor every caret row, so there the caret wins — it
+/// is where the reviewer is typing. `caret` is its display row while the
+/// comment box is open, `None` otherwise. Pure so it's directly testable.
+fn follow_display(
+    scroll: usize,
+    anchor: usize,
+    map: &DispMap,
+    viewport: usize,
+    caret: Option<usize>,
+) -> usize {
     let viewport = viewport.max(1);
-    let dc = map.disp(cursor);
-    let tail = dc + map.extra_at(cursor);
-    // A span taller than the viewport can't satisfy both rules below, so anchor
-    // on its tail; that keeps the span's bottom visible and is a fixed point.
-    if map.extra_at(cursor) + 1 > viewport {
-        return (tail + 1).saturating_sub(viewport);
+    let dc = map.disp(anchor);
+    let tail = dc + map.extra_at(anchor);
+    // Over-tall span: follow the caret, sticky (a caret already in the window
+    // never moves it) and one row short of the bottom, so the box's bottom
+    // rule with its buttons stays visible while typing at the end.
+    if map.extra_at(anchor) + 1 > viewport {
+        let focus = caret.unwrap_or(dc);
+        // Scrolloff: a row below the caret (the box's bottom rule) and, when
+        // the window has room for it, one above (its top rule) — so context
+        // shows on both sides and the fixed point stays stable.
+        let keep = viewport.saturating_sub(2);
+        let above = usize::from(keep >= 1);
+        if focus < scroll + above {
+            return focus.saturating_sub(above);
+        }
+        if focus > scroll + keep {
+            return focus - keep;
+        }
+        return scroll;
     }
     if dc < scroll {
         dc
@@ -767,8 +789,12 @@ fn input_text(editor: &TextArea<'static>) -> String {
     editor.lines().join("\n")
 }
 
-/// Insert the visible caret at tui-textarea's character-wise cursor position.
-fn input_display_text(editor: &TextArea<'static>) -> String {
+/// The caret glyph `input_display_text` inserts at the cursor. `wrap_comment`
+/// treats it as an ordinary word character, like the editor would.
+const CARET: &str = "\u{258f}";
+
+/// Byte offset in `input_text`'s joined buffer where the caret belongs.
+fn input_caret_offset(editor: &TextArea<'static>) -> usize {
     let (cursor_row, cursor_col) = editor.cursor();
     let mut at = 0;
     for (row, line) in editor.lines().iter().enumerate() {
@@ -778,8 +804,40 @@ fn input_display_text(editor: &TextArea<'static>) -> String {
         }
         at += line.len() + 1; // the newline inserted by `input_text`
     }
+    at
+}
+
+/// Insert the visible caret at tui-textarea's character-wise cursor position.
+fn input_display_text(editor: &TextArea<'static>) -> String {
+    let at = input_caret_offset(editor);
     let text = input_text(editor);
-    format!("{}\u{258f}{}", &text[..at], &text[at..])
+    format!("{}{CARET}{}", &text[..at], &text[at..])
+}
+
+/// Which wrapped content row of the editing box the caret renders on — the
+/// caret's word is wrapped WHOLE, because greedy word wrap decides on the
+/// whole word: a truncated `"hello won"` fits where `"hello wonderful"`
+/// moves to the next row, so wrapping just the prefix reports a row too high.
+fn caret_content_row(display_text: &str, caret: usize, width: usize) -> usize {
+    let rest = &display_text[caret + CARET.len()..];
+    let end = caret + CARET.len() + rest.find([' ', '\n']).unwrap_or(rest.len());
+    wrap_comment(&display_text[..end], width).len() - 1
+}
+
+/// Display row of the caret inside the open comment box: the box is woven
+/// directly under its anchor row as `[top rule] + wrapped text + [bottom
+/// rule]`, so the caret sits two rows below that anchor plus its own wrapped
+/// content row.
+fn caret_display_row(
+    map: &DispMap,
+    row_end: usize,
+    editor: &TextArea<'static>,
+    inner_width: usize,
+) -> usize {
+    let text = input_display_text(editor);
+    let width = editing_wrap_width(inner_width);
+    let row = caret_content_row(&text, input_caret_offset(editor), width);
+    map.disp(row_end) + 2 + row
 }
 
 fn submits_input(key: &KeyEvent) -> bool {
@@ -2163,13 +2221,21 @@ impl<'a> App<'a> {
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
-        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator, self.nav_width));
-        self.diff.scroll = follow_display(
-            self.diff.scroll,
-            self.diff.cursor,
-            &map,
-            diff_viewport_rows(term_size, self.show_navigator, self.nav_width, self.footer_rows()),
-        );
+        let inner = diff_inner_width(term_size, self.show_navigator, self.nav_width);
+        let map = self.disp_map(inner);
+        // While the box is open the (frozen) diff cursor isn't what the view
+        // must follow: the box hangs under its own anchor row, and with it
+        // taller than the viewport the caret inside it is what has to stay
+        // visible — moving the caret up past the window top must scroll.
+        let (anchor, caret) = match &self.input {
+            Some(InputMode::Comment { editor, row_end, .. }) => {
+                (*row_end, Some(caret_display_row(&map, *row_end, editor, inner)))
+            }
+            _ => (self.diff.cursor, None),
+        };
+        let viewport =
+            diff_viewport_rows(term_size, self.show_navigator, self.nav_width, self.footer_rows());
+        self.diff.scroll = follow_display(self.diff.scroll, anchor, &map, viewport, caret);
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, term_size: Size) {
@@ -4166,15 +4232,15 @@ mod tests {
         // last visible display row.
         let mut scroll = 0;
         for cursor in 0..=15 {
-            scroll = follow_display(scroll, cursor, &no_comments, vp);
+            scroll = follow_display(scroll, cursor, &no_comments, vp, None);
         }
         assert_eq!(scroll, 6); // 15 - 10 + 1
 
         // Inside the viewport: unchanged.
-        assert_eq!(follow_display(6, 14, &no_comments, vp), 6);
+        assert_eq!(follow_display(6, 14, &no_comments, vp, None), 6);
 
         // Above the viewport top: scroll snaps up to the cursor.
-        assert_eq!(follow_display(6, 5, &no_comments, vp), 5);
+        assert_eq!(follow_display(6, 5, &no_comments, vp, None), 5);
     }
 
     #[test]
@@ -4288,7 +4354,10 @@ mod tests {
         assert_eq!(map.base_at(map.disp(21), 30), 21);
         // follow_display keeps working through the composed map: jumping the
         // cursor below the fold scrolls by DISPLAY rows, not base rows.
-        assert_eq!(follow_display(0, 21, &map, 10), map.disp(21) + map.extra_at(21) + 1 - 10);
+        assert_eq!(
+            follow_display(0, 21, &map, 10, None),
+            map.disp(21) + map.extra_at(21) + 1 - 10
+        );
     }
 
     /// A 40-line file on disk plus the sample diff model, in source view
@@ -4809,6 +4878,25 @@ mod tests {
     }
 
     #[test]
+    fn caret_content_row_wraps_the_caret_word_whole() {
+        let width = 10;
+        // `"hello wonderful world"` with the caret inside `"wonderful"`,
+        // which wraps onto row 1. Wrapping only the text up to the caret
+        // would say row 0: `"hello wo"` still fits the first row, but the
+        // WHOLE word does not, and word wrap decides on the whole word.
+        let text = format!("hello wo{CARET}nderful world");
+        let caret = text.find(CARET).unwrap();
+        assert_eq!(caret_content_row(&text, caret, width), 1);
+        // At the very start it is row 0, and the glyph's own column counts.
+        let text = format!("{CARET}hello world");
+        assert_eq!(caret_content_row(&text, 0, width), 0);
+        // An explicit newline starts a new row even mid-word.
+        let text = format!("hello\n{CARET}world");
+        let caret = text.find(CARET).unwrap();
+        assert_eq!(caret_content_row(&text, caret, width), 1);
+    }
+
+    #[test]
     fn comment_height_matches_rendered_line_count() {
         let text = "a fairly long review comment that will definitely need wrapping at narrow widths";
         for width in [20usize, 40, 80, 200] {
@@ -5028,9 +5116,9 @@ mod tests {
         // shows display rows 0..=9, but row 9's comment is display row 10 —
         // follow must scroll by one so the annotation text stays on screen.
         let map = DispMap::new(vec![9]);
-        assert_eq!(follow_display(0, 9, &map, 10), 1);
+        assert_eq!(follow_display(0, 9, &map, 10, None), 1);
         // Without the comment, no scroll needed.
-        assert_eq!(follow_display(0, 9, &DispMap::new(vec![]), 10), 0);
+        assert_eq!(follow_display(0, 9, &DispMap::new(vec![]), 10, None), 0);
     }
 
     #[test]
@@ -5122,6 +5210,93 @@ mod tests {
             tail < app.diff.scroll + viewport,
             "box bottom (tail={tail}) must stay within the viewport (scroll={}, viewport={viewport})",
             app.diff.scroll
+        );
+    }
+
+    #[test]
+    fn caret_inside_an_over_tall_comment_box_stays_on_screen() {
+        // With a box taller than the viewport no window can show it whole,
+        // so the caret inside it has to win: an over-tall box whose scroll
+        // was pinned to one end (top or bottom) left the caret invisible the
+        // moment it moved past that end, and moving back into the window was
+        // the only way to see it again. The input BAR renders the same
+        // buffer with its own caret, so a clipped caret in the box goes
+        // unnoticed unless the check looks at the diff pane alone.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let term = Size::new(100, 30);
+        app.diff.cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), term);
+        let tall: String = (0..20).map(|n| format!("line {n:02}\n")).collect();
+        app.handle_paste(&tall, term);
+
+        let viewport =
+            diff_viewport_rows(term, app.show_navigator, app.nav_width, app.footer_rows());
+        let map = app.disp_map(diff_inner_width(term, app.show_navigator, app.nav_width));
+        assert!(
+            map.extra_at(app.diff.cursor) + 1 > viewport,
+            "fixture must produce a box taller than the viewport (span={}, viewport={viewport})",
+            map.extra_at(app.diff.cursor) + 1
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let pane = |app: &App, terminal: &mut Terminal<TestBackend>| -> String {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let (_, diff_rect) =
+                body_rects(term, app.show_navigator, app.nav_width, app.footer_rows());
+            (diff_rect.y..diff_rect.y + diff_rect.height)
+                .map(|y| {
+                    (diff_rect.x..diff_rect.x + diff_rect.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let start = pane(&app, &mut terminal);
+        assert!(start.contains(CARET), "the caret starts on screen:\n{start}");
+
+        // One step up leaves the caret inside the window, so the view must
+        // stay put — following the caret is not the same as jumping around.
+        let scroll = app.diff.scroll;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), term);
+        assert_eq!(
+            app.diff.scroll, scroll,
+            "a caret already in view must not move the view"
+        );
+
+        // Walking to the top of the buffer must bring the caret with it, one
+        // row at a time. Without the follow it climbs out of the window after
+        // a row or two and stays invisible for the rest of the walk.
+        for step in 0..20 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), term);
+            assert!(
+                app.diff.scroll <= scroll,
+                "step {step} scrolled the wrong way ({} > {scroll})",
+                app.diff.scroll
+            );
+            let text = pane(&app, &mut terminal);
+            assert!(
+                text.contains(CARET),
+                "step {step}: the caret climbed off screen:\n{text}"
+            );
+        }
+        assert!(
+            app.diff.scroll < scroll,
+            "reaching the first line must have scrolled the box up"
+        );
+        // At the top of the buffer the window shows the box's opening rule
+        // above the caret, so it's clear the box isn't cut off.
+        let top = pane(&app, &mut terminal);
+        assert!(
+            top.contains('\u{256d}'),
+            "the box's top rule must be visible:\n{top}"
         );
     }
 
@@ -7763,10 +7938,12 @@ mod tests {
         for disp_row in 1..1 + h {
             assert_eq!(map.base_at(disp_row, 3), 1);
         }
-        // And the scroll follow keeps the row's LAST wrapped line on
-        // screen, same as it does for a tall comment stack.
-        let scroll = follow_display(0, 1, &map, 3);
-        assert_eq!(scroll, (1 + h).saturating_sub(3));
+        // And the scroll follow keeps the ANCHOR row itself on screen when
+        // the continuations push past the window: with no caret inside them
+        // (a wrapped diff row, not an input box) the row wins, so scrolling
+        // back up snaps to it — bar the one row of scrolloff above.
+        let scroll = follow_display(5, 1, &map, 3, None);
+        assert_eq!(scroll, map.disp(1) - 1);
 
         // Off wrap, the same map goes back to one display row per base row.
         app.wrap = false;
