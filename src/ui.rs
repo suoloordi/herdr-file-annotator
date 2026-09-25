@@ -1864,11 +1864,16 @@ impl<'a> App<'a> {
         }
     }
 
-    /// The summary footer grows one terminal row per explicit input line.
+    /// An input footer grows one terminal row per explicit line in its box:
+    /// both the summary and the comment box accept Alt+Enter, so both need
+    /// the room. One row is the floor — the prompt label always lives
+    /// somewhere.
     fn footer_rows(&self) -> u16 {
         match &self.input {
-            Some(InputMode::Summary { editor }) => editor.lines().len().min(u16::MAX as usize) as u16,
-            _ => 1,
+            Some(InputMode::Summary { editor } | InputMode::Comment { editor, .. }) => {
+                editor.lines().len().min(u16::MAX as usize) as u16
+            }
+            None => 1,
         }
     }
 
@@ -3038,13 +3043,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Some(InputMode::Comment { editor, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
             let label = format!(" comment [tag: {tag_label}]: ");
-            vec![Line::raw(format!(
-                "{label}{}",
-                tail_fit(
-                    &input_display_text(editor),
-                    (area.width as usize).saturating_sub(label.chars().count()),
-                )
-            ))]
+            let label_cols = str_cols(&label);
+            input_display_text(editor)
+                .split('\n')
+                .enumerate()
+                .map(|(row, text)| {
+                    // Only the first row pays for the label; continuation rows
+                    // get the bar's full width so a long line stays readable.
+                    if row == 0 {
+                        let avail = (area.width as usize).saturating_sub(label_cols);
+                        Line::raw(format!("{label}{}", tail_fit(text, avail)))
+                    } else {
+                        Line::raw(tail_fit(text, area.width as usize))
+                    }
+                })
+                .collect()
         }
         None => {
             let context = match app.focus {
@@ -6795,6 +6808,53 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size)
             .expect("Enter submits the summary");
         assert_eq!(outcome.summary.as_deref(), Some(pasted.trim()));
+    }
+
+    #[test]
+    fn multiline_footer_bars_render_one_row_per_input_line() {
+        // Both boxes accept Alt+Enter, so both bars must grow and show the
+        // newlines: a single `Line` renders the whole buffer on one row and
+        // lets `tail_fit` clip the earlier lines out of sight.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.diff.cursor = 1;
+        let size = Size::new(40, 14);
+
+        // Type the comment the way a reviewer does, breaking the line with
+        // Alt+Enter (plain Enter would submit).
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "first".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), size);
+        for ch in "second".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+
+        assert!(
+            matches!(&app.input, Some(InputMode::Comment { editor, .. }) if input_text(editor) == "first\nsecond"),
+            "Alt+Enter must split the comment box across two lines"
+        );
+        assert_eq!(app.footer_rows(), 2, "the comment bar grows for its second line");
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+
+        // 14 rows of terminal: header, note, 10 body, then the two footer rows.
+        let (bar_row_1, bar_row_2) = (row_text(12), row_text(13));
+        assert!(
+            bar_row_1.contains("comment [tag: none]") && bar_row_1.contains("first"),
+            "the labelled first line belongs on the bar's first row, was {bar_row_1:?}"
+        );
+        assert!(bar_row_2.contains("second"), "the second line needs its own row, was {bar_row_2:?}");
+        assert!(!bar_row_2.contains("[tag"), "the label must not repeat, was {bar_row_2:?}");
+        assert!(bar_row_2.contains('\u{258f}'), "the caret must stay visible, was {bar_row_2:?}");
     }
 
     #[test]
